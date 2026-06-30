@@ -1,0 +1,200 @@
+[gd_resource type="ShaderMaterial" load_steps=4 format=2]
+
+[sub_resource type="Shader" id=754]
+code = "shader_type spatial;
+
+//THIS EFFECT IS BEST USED ONLY ON FLOORS OR SIMILAR SUCH AS TERRAIN, NOT ON WALLS
+
+//REFLECTION_STRENGTH = how strong the reflection is
+//DISTORTION_STRENGTH = how strong the reflection is distorted by normal mapping
+//RIPPLE_SPEED = optional moving water effect for the reflections
+//REFLECTION_SATURATION = how saturated the reflection colors are
+//GROW_AMOUNT = how much the reflection is offsetted to avoid z-fighting issues
+//LOD = level of detail of screen texture effects
+//OFFSET = how much the reflection is moved vertically to fake SSR
+//BRIGHTNESS_THRESHOLD = how bright the pixels should be to contribute to reflections
+//BRIGHTNESS_SOFTNESS = how soft the threshold will be
+//USE_DISTANCE_FADE = add a distance culling optimization
+//FADE_START = distance where the fade begins
+//FADE_END = distance where the fade ends
+//NOISE_TRIPLANAR_SCALE = triplanar scale of the noise map
+//EDGE_FADE_X = fade amount when effect goes offscreen horizontally
+//EDGE_FADE_Y = fade amount when effect goes offscreen horizontally
+//NOISE_TEX = noise texture for distortion
+//MASK_TEX = texture to mask the reflection in a texture
+
+render_mode unshaded, cull_back, blend_add;
+
+uniform sampler2D noise_tex;
+uniform sampler2D mask_tex;
+
+uniform float reflection_strength : hint_range(0.0, 1.0, 0.1) = 0.5;
+uniform float distortion_strength = 0.02;
+uniform float ripple_speed = 0.5;
+uniform float reflection_saturation : hint_range(0.0, 2.0) = 1.0;
+
+
+uniform float grow_amount : hint_range(-0.2, 0.2, 0.001) = 0.0;
+
+uniform float lod = 2.0;
+uniform float offset = 0.2;
+// Bright-pass controls
+uniform float brightness_threshold = 0.8;
+uniform float brightness_softness = 0.2;
+
+uniform bool use_distance_fade = true;
+uniform float fade_start = 15.0;
+uniform float fade_end = 25.0;
+uniform float noise_triplanar_scale = 0.5;
+
+uniform float edge_fade_x : hint_range(0.01, 1.0) = 0.7;
+uniform float edge_fade_y : hint_range(0.01, 1.0) = 0.9;
+
+varying vec3 world_pos;
+varying vec3 world_normal;
+
+vec3 get_triplanar_weights(vec3 normal) {
+    vec3 blending = abs(normal);
+    blending = max(blending, vec3(0.00001));
+    blending /= (blending.x + blending.y + blending.z);
+    return blending;
+}
+
+vec2 sample_triplanar_noise(vec3 pos, vec3 normal, float scale) {
+    vec3 blend = get_triplanar_weights(normal);
+
+    vec2 uv_x = pos.yz * scale;
+    vec2 uv_y = pos.xz * scale;
+    vec2 uv_z = pos.xy * scale;
+
+    vec2 x = texture(noise_tex, uv_x).rg;
+    vec2 y = texture(noise_tex, uv_y).rg;
+    vec2 z = texture(noise_tex, uv_z).rg;
+
+    return x * blend.x +
+           y * blend.y +
+           z * blend.z;
+}
+void vertex() {
+    VERTEX += NORMAL * grow_amount;
+	
+    world_pos = (WORLD_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    world_normal = normalize((WORLD_MATRIX * vec4(NORMAL, 0.0)).xyz);
+	
+}
+
+void fragment() {
+
+    vec2 screen_uv = SCREEN_UV;
+	
+	float distance_fade = 1.0;
+	
+	vec3 animated_pos = world_pos + vec3(TIME * ripple_speed);
+
+	vec2 noise = sample_triplanar_noise(
+	    animated_pos,
+	    world_normal,
+	    noise_triplanar_scale
+	) * 2.0 - 1.0;
+
+    vec2 distorted_uv = screen_uv + noise * distortion_strength;
+
+    distorted_uv.y += offset;
+
+    vec2 edge_dist = min(distorted_uv, 1.0 - distorted_uv);
+	
+	vec2 n = texture(noise_tex, UV * 3.0 + TIME * ripple_speed).rg * 2.0 - 1.0;
+
+	// small distortion spread
+	vec2 d1 = distorted_uv + n * distortion_strength;
+	vec2 d2 = distorted_uv - n * distortion_strength;
+	vec2 d3 = distorted_uv + vec2(n.y, -n.x) * distortion_strength * 1.5;
+	
+	// sample screen multiple times
+	vec3 s1 = textureLod(SCREEN_TEXTURE, d1, lod).rgb;
+	vec3 s2 = textureLod(SCREEN_TEXTURE, d2, lod).rgb;
+	vec3 s3 = textureLod(SCREEN_TEXTURE, d3, lod).rgb;
+		
+	float edge_fade =
+	    smoothstep(0.0, edge_fade_x, edge_dist.x) *
+	    smoothstep(0.0, edge_fade_y, edge_dist.y);
+		
+	vec3 screen_col =
+	    textureLod(SCREEN_TEXTURE, distorted_uv, lod).rgb;
+		
+	// luminance
+	float lum = dot(screen_col, vec3(0.2126, 0.7152, 0.0722));
+    // Bright-pass mask
+    float bright_mask = smoothstep(
+        brightness_threshold,
+        brightness_threshold + brightness_softness,
+        lum
+    );
+
+	// smooth bright isolation (better than hard threshold)
+	float glint = smoothstep(0.6, 1.0, lum);
+
+	// amplify highlights aggressively
+	float glint_boost = mix(1.0, 6.0, glint);
+	
+	vec3 ref = (s1 + s2 + s3) / 3.0;
+	
+	// apply it
+	vec3 reflection = vec3(0.0);
+
+	reflection = ref * glint_boost;
+	
+	// Saturation adjustment
+	float gray = dot(reflection, vec3(0.2126, 0.7152, 0.0722));
+	reflection = mix(vec3(gray), reflection, reflection_saturation);
+	
+    float mask = texture(mask_tex, UV).a;
+	float depth = textureLod(DEPTH_TEXTURE, SCREEN_UV, 3.0).x;
+	if (use_distance_fade) {
+
+	    // linearize depth (important!)
+	    float z = depth * 2.0 - 1.0;
+	    float linear_depth = (2.0 * 0.1 * 100.0) / (100.0 + 0.1 - z * (100.0 - 0.1));
+	    // ^ assumes near=0.1 far=100.0 (adjust if needed)
+
+	    if (linear_depth >= fade_end)
+	        discard;
+
+	    distance_fade = 1.0 - smoothstep(fade_start, fade_end, linear_depth);
+	}
+	
+    ALBEDO = reflection * distance_fade;
+    ALPHA = mask * (reflection_strength * 1.3) * bright_mask * edge_fade * distance_fade;
+}"
+
+[sub_resource type="OpenSimplexNoise" id=53]
+octaves = 9
+period = 30.2
+lacunarity = 1.77
+
+[sub_resource type="NoiseTexture" id=54]
+width = 256
+height = 256
+seamless = true
+as_normalmap = true
+noise = SubResource( 53 )
+
+[resource]
+render_priority = 2
+shader = SubResource( 754 )
+shader_param/reflection_strength = 0.9
+shader_param/distortion_strength = 0.6
+shader_param/ripple_speed = 0.002
+shader_param/reflection_saturation = 0.6
+shader_param/grow_amount = 0.001
+shader_param/lod = 1.5
+shader_param/offset = 0.2
+shader_param/brightness_threshold = -0.276
+shader_param/brightness_softness = 0.449
+shader_param/use_distance_fade = true
+shader_param/fade_start = 20.0
+shader_param/fade_end = 70.0
+shader_param/noise_triplanar_scale = 0.125
+shader_param/edge_fade_x = 0.05
+shader_param/edge_fade_y = 0.9
+shader_param/noise_tex = SubResource( 54 )
