@@ -131,7 +131,7 @@ void fragment() {
         lum
     );
 
-	// smooth bright isolation (better than hard threshold)
+	// smooth bright isolation
 	float glint = smoothstep(0.6, 1.0, lum);
 
 	// amplify highlights aggressively
@@ -152,7 +152,7 @@ void fragment() {
 	float depth = textureLod(DEPTH_TEXTURE, SCREEN_UV, 3.0).x;
 	if (use_distance_fade) {
 
-	    // linearize depth (important!)
+	    // linearize depth
 	    float z = depth * 2.0 - 1.0;
 	    float linear_depth = (2.0 * 0.1 * 100.0) / (100.0 + 0.1 - z * (100.0 - 0.1));
 	    // ^ assumes near=0.1 far=100.0 (adjust if needed)
